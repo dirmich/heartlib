@@ -10,6 +10,9 @@ import torchaudio
 import json
 from contextlib import contextmanager
 import gc
+import subprocess
+import tempfile
+import wave
 
 
 def _resolve_paths(pretrained_path: str, version: str):
@@ -339,7 +342,32 @@ class HeartMuLaGenPipeline:
         frames = model_outputs["frames"].to(self.codec_device)
         wav = self.codec.detokenize(frames)
         self._unload()
-        torchaudio.save(save_path, wav.to(torch.float32).cpu(), 48000)
+        audio = wav.to(torch.float32).cpu().squeeze(0).numpy()
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        if save_path.lower().endswith(".mp3"):
+            # torchaudio.save delegates to torchcodec in recent torchaudio
+            # versions; use the system ffmpeg encoder to avoid a torchcodec
+            # ABI dependency on ARM64 CUDA installations.
+            with tempfile.TemporaryDirectory(prefix="heartmula-audio-") as tmp:
+                wav_path = os.path.join(tmp, "audio.wav")
+                if audio.ndim == 1:
+                    channels = 1
+                    pcm_audio = audio
+                else:
+                    channels = audio.shape[0]
+                    pcm_audio = audio.T
+                pcm = (pcm_audio.clip(-1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+                with wave.open(wav_path, "wb") as wav_file:
+                    wav_file.setnchannels(channels)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(48000)
+                    wav_file.writeframes(pcm)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error", "-i", wav_path, save_path],
+                    check=True,
+                )
+        else:
+            raise ValueError("Only .mp3 output is supported by the HeartMuLa runner")
 
     def __call__(self, inputs: Dict[str, Any], **kwargs):
         preprocess_kwargs, forward_kwargs, postprocess_kwargs = (
